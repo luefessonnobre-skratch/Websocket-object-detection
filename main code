@@ -1,0 +1,311 @@
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ESP32Servo.h>
+
+const char* SSID     = "XXXXXXXXXX";
+const char* PASSWORD = "XXXXXXXXXX";
+
+#define SERVO_LEFT_PIN  18
+#define SERVO_RIGHT_PIN 19
+
+#define SERVO_STOP        1500
+#define SERVO_FORWARD_MAX 1900
+#define SERVO_BACK_MAX    1100
+#define SERVO_DEADBAND    20
+
+#define TRIG_PINL 26
+#define TRIG_PINR 27
+#define ECHO_PINL 14
+#define ECHO_PINR 25
+
+#define BUZZER_PINL 32
+#define BUZZER_PINR 33
+
+// ── WiFi: try and reconetion ──────────────────────────────────────────────
+#define WIFI_MAX_ATTEMPTS   60          
+#define WIFI_RECONNECT_MS   10000       
+unsigned long lastReconnectAttempt = 0;
+
+// ── Global objects ─────────────────────────────────────────────────────────────
+Servo servoLeft;
+Servo servoRight;
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// ── Ultrasonic timing ──────────────────────────────────────────────────────────
+unsigned long lastUSReading = 0;
+const unsigned long usInterval = 60;
+bool readingLeft = true;
+
+// ── WiFi status monitoring ─────────────────────────────────────────────────────
+bool wifiOk       = false;
+bool serverStarted = false;
+
+// ── Sound speed compensation ───────────────────────────────────────────────────
+float tempCelsius = 25.0;
+
+// ── Motor state ────────────────────────────────────────────────────────────────
+struct MotorState {
+  bool  active;
+  bool  forward;
+  float speed;
+  int   pulseWidth;
+};
+
+MotorState motorL = {false, true, 0.0f, SERVO_STOP};
+MotorState motorR = {false, true, 0.0f, SERVO_STOP};
+
+// ──────────────────────────────────────────────────────────────────────────────
+void applyMotor(Servo& sv, MotorState& m) {
+  if (!m.active || m.speed < 0.01f) {
+    sv.writeMicroseconds(SERVO_STOP);
+    m.pulseWidth = SERVO_STOP;
+    return;
+  }
+
+  int target;
+  if (m.forward) {
+    target = SERVO_STOP + (int)(m.speed * (SERVO_FORWARD_MAX - SERVO_STOP));
+  } else {
+    target = SERVO_STOP - (int)(m.speed * (SERVO_STOP - SERVO_BACK_MAX));
+  }
+
+  target = constrain(target, SERVO_BACK_MAX, SERVO_FORWARD_MAX);
+  if (abs(target - SERVO_STOP) < SERVO_DEADBAND) target = SERVO_STOP;
+
+  sv.writeMicroseconds(target);
+  m.pulseWidth = target;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+void handleMessage(String msg) {
+  auto extract = [&](String key) -> String {
+    int idx = msg.indexOf("\"" + key + "\":");
+    if (idx < 0) return "";
+    int start = idx + key.length() + 3;
+    while (start < (int)msg.length() && msg[start] == ' ') start++;
+    int end = start;
+    while (end < (int)msg.length() && msg[end] != ',' && msg[end] != '}') end++;
+    return msg.substring(start, end);
+  };
+
+  String motor   = extract("motor");
+  String active  = extract("active");
+  String forward = extract("forward");
+  String speedS  = extract("speed");
+
+  motor.replace("\"", "");
+  motor.trim();
+
+  bool  isActive = (active.indexOf("true")  >= 0);
+  bool  isFwd    = (forward.indexOf("true") >= 0);
+  float spd      = constrain(speedS.toFloat(), 0.0f, 1.0f);
+
+  MotorState* m  = nullptr;
+  Servo*      sv = nullptr;
+
+  if (motor == "L") { m = &motorL; sv = &servoLeft;  }
+  if (motor == "R") { m = &motorR; sv = &servoRight; }
+
+  if (m && sv) {
+    m->active  = isActive;
+    m->forward = isFwd;
+    m->speed   = spd;
+    applyMotor(*sv, *m);
+
+    Serial.printf("[%s] active=%d fwd=%d speed=%.2f pulse=%d\n",
+                  motor.c_str(), m->active, m->forward, m->speed, m->pulseWidth);
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+void onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
+               AwsEventType type, void* arg, uint8_t* data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("WS client connected: #%u\n", client->id());
+
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("WS client disconnected: #%u\n", client->id());
+    motorL.active = false; applyMotor(servoLeft,  motorL);
+    motorR.active = false; applyMotor(servoRight, motorR);
+
+  } else if (type == WS_EVT_DATA) {
+    AwsFrameInfo* info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len
+        && info->opcode == WS_TEXT) {
+      String msg = "";
+      for (size_t i = 0; i < len; i++) msg += (char)data[i];
+      handleMessage(msg);
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// start servr
+// ──────────────────────────────────────────────────────────────────────────────
+void startServer() {
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "text/plain",
+      "ESP32 Servo Controller running.\n"
+      "ESP32 IP address: " + WiFi.localIP().toString());
+  });
+
+  server.begin();
+  serverStarted = true;
+  Serial.println("HTTP server started.");
+  Serial.print("IP address: "); Serial.println(WiFi.localIP());
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Wifi conction
+// ──────────────────────────────────────────────────────────────────────────────
+bool connectWiFi() {
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+
+
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+
+  WiFi.begin(SSID, PASSWORD);
+  Serial.printf("Conectando a \"%s\"", SSID);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < WIFI_MAX_ATTEMPTS) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi conectado!");
+    Serial.printf("  SSID  : %s\n",   WiFi.SSID().c_str());
+    Serial.printf("  IP    : %s\n",   WiFi.localIP().toString().c_str());
+    Serial.printf("  RSSI  : %d dBm\n", WiFi.RSSI());
+    return true;
+  }
+
+  Serial.print("Falha na conexão. Status: ");
+  switch (WiFi.status()) {
+    case WL_NO_SSID_AVAIL:   Serial.println("Rede não encontrada (SSID ausente)"); break;
+    case WL_CONNECT_FAILED:  Serial.println("Conexão recusada (senha errada?)");   break;
+    case WL_CONNECTION_LOST: Serial.println("Conexão perdida durante handshake");  break;
+    case WL_DISCONNECTED:    Serial.println("Desconectado (timeout de DHCP?)");    break;
+    default:                 Serial.printf("Código desconhecido: %d\n", WiFi.status());
+  }
+  return false;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\n╔════════════════════════════╗");
+  Serial.println(    "║  ESP32 Servo WS Controller ║");
+  Serial.println(    "╚════════════════════════════╝");
+
+  // Servo initialization
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  servoLeft.setPeriodHertz(50);
+  servoRight.setPeriodHertz(50);
+  servoLeft.attach(SERVO_LEFT_PIN,   SERVO_BACK_MAX, SERVO_FORWARD_MAX);
+  servoRight.attach(SERVO_RIGHT_PIN, SERVO_BACK_MAX, SERVO_FORWARD_MAX);
+  servoLeft.writeMicroseconds(SERVO_STOP);
+  servoRight.writeMicroseconds(SERVO_STOP);
+  Serial.println("Servos initialized -> STOP");
+
+  // Ultrasonic sensors and buzzers
+  pinMode(TRIG_PINL,   OUTPUT);
+  pinMode(TRIG_PINR,   OUTPUT);
+  pinMode(ECHO_PINL,   INPUT);
+  pinMode(ECHO_PINR,   INPUT);
+  pinMode(BUZZER_PINL, OUTPUT);
+  pinMode(BUZZER_PINR, OUTPUT);
+
+  wifiOk = connectWiFi();
+  if (wifiOk) startServer();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+void loop() {
+  unsigned long now = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiOk) {
+      wifiOk = false;
+      Serial.println("WiFi perdido! Parando motores...");
+      motorL.active = false; applyMotor(servoLeft,  motorL);
+      motorR.active = false; applyMotor(servoRight, motorR);
+    }
+
+    if (now - lastReconnectAttempt >= WIFI_RECONNECT_MS) {
+      lastReconnectAttempt = now;
+      Serial.println("Tentando reconectar ao WiFi...");
+      wifiOk = connectWiFi();
+      if (wifiOk && !serverStarted) startServer();
+    }
+    return;
+
+  } else if (!wifiOk) {
+    wifiOk = true;
+    Serial.println("WiFi reconectado!");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+  }
+
+  if (now - lastUSReading >= usInterval) {
+    lastUSReading = now;
+
+    float soundSpeed = 0.03313f + 0.0000606f * tempCelsius;
+
+    if (readingLeft) {
+      digitalWrite(TRIG_PINL, LOW);
+      delayMicroseconds(2);
+      digitalWrite(TRIG_PINL, HIGH);
+      delayMicroseconds(10);
+      digitalWrite(TRIG_PINL, LOW);
+
+      long  durationL = pulseIn(ECHO_PINL, HIGH, 30000);
+      float distanceL = durationL * soundSpeed / 2;
+
+      if (distanceL > 0 && distanceL <= 12) {
+        tone(BUZZER_PINL, 440);
+        motorL.active = false;
+        applyMotor(servoLeft, motorL);
+      } else {
+        noTone(BUZZER_PINL);
+      }
+
+      ws.textAll("{\"sensor\":\"L\",\"dist\":" + String(distanceL, 1) + "}");
+
+    } else {
+      digitalWrite(TRIG_PINR, LOW);
+      delayMicroseconds(2);
+      digitalWrite(TRIG_PINR, HIGH);
+      delayMicroseconds(10);
+      digitalWrite(TRIG_PINR, LOW);
+
+      long  durationR = pulseIn(ECHO_PINR, HIGH, 30000);
+      float distanceR = durationR * soundSpeed / 2;
+
+      if (distanceR > 0 && distanceR <= 12) {
+        tone(BUZZER_PINR, 220);
+        motorR.active = false;
+        applyMotor(servoRight, motorR);
+      } else {
+        noTone(BUZZER_PINR);
+      }
+
+      ws.textAll("{\"sensor\":\"R\",\"dist\":" + String(distanceR, 1) + "}");
+    }
+
+    readingLeft = !readingLeft;
+  }
+
+  ws.cleanupClients();
+}
